@@ -1,0 +1,29 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Project {
+  id        String     @id @default(cuid())
+  name      String
+  createdAt DateTime   @default(now())
+  documents Document[]
+}
+
+model Document {
+  id           String   @id @default(cuid())
+  projectId    String
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  filename     String
+  fileType     String
+  status       String   // "pending" | "processing" | "ready" | "failed"
+  uploadedAt   DateTime @default(now())
+  errorMessage String?
+} 

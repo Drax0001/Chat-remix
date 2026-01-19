@@ -59,21 +59,21 @@ This backend system provides a complete RAG pipeline that:
 1. **Clone the repository**
 
    ```bash
-   git clone <repository-url>
-   cd rag-chatbot-backend
+   git clone [https://github.com/Drax0001/Chat-remix](https://github.com/Drax0001/Chat-remix)
+   cd Chat-remix
    ```
 
 2. **Install dependencies**
 
    ```bash
-   npm install
+   bun install
    ```
 
 3. **Set up databases**
 
    ```bash
    # PostgreSQL - create database
-   createdb rag_chatbot
+   createdb chat_remix
 
    # ChromaDB - start server (if running locally)
    docker run -p 8000:8000 chromadb/chroma
@@ -103,7 +103,7 @@ This backend system provides a complete RAG pipeline that:
 
 | Variable         | Description                             | Example                                             |
 | ---------------- | --------------------------------------- | --------------------------------------------------- |
-| `DATABASE_URL`   | PostgreSQL connection string            | `postgresql://user:pass@localhost:5432/rag_chatbot` |
+| `DATABASE_URL`   | PostgreSQL connection string            | `postgresql://user:pass@localhost:5432/chat_remix` |
 | `GOOGLE_API_KEY` | Google Gemini API key (if using Gemini) | `AIzaSy...`                                         |
 
 ### Database Configuration
@@ -147,7 +147,7 @@ This backend system provides a complete RAG pipeline that:
 
 ```bash
 # Database
-DATABASE_URL="postgresql://user:password@localhost:5432/rag_chatbot"
+DATABASE_URL="postgresql://user:password@localhost:5432/chat_remix"
 
 # Google Gemini (default)
 GOOGLE_API_KEY="your-gemini-api-key-here"

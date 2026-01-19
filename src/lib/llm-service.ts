@@ -10,7 +10,67 @@
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { getConfig } from "./config";
-import { LLMError, QuotaExceededError, TimeoutError } from "./errors";
+import { LLMError, QuotaExceededError, TimeoutError, ServiceUnavailableError } from "./errors";
+import { CircuitBreaker, withRetryAndCircuitBreaker } from "./retry";
+
+// For local LLM endpoints
+interface LocalLLMRequest {
+  messages: Array<{ role: string; content: string }>;
+  temperature?: number;
+  max_tokens?: number;
+}
+
+interface LocalLLMResponse {
+  choices: Array<{ message: { content: string } }>;
+}
+
+/**
+ * Calls a local LLM endpoint via HTTP
+ * @private
+ */
+private async callLocalLLM(systemPrompt: string, userPrompt: string): Promise<string> {
+  const { llm } = this.config;
+
+  if (!llm.endpoint) {
+    throw new LLMError("Local LLM endpoint is required for local provider");
+  }
+
+  const request: LocalLLMRequest = {
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt }
+    ],
+    temperature: Math.min(llm.temperature, 0.3),
+    max_tokens: llm.maxTokens,
+  };
+
+  try {
+    const response = await fetch(llm.endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(request),
+    });
+
+    if (!response.ok) {
+      throw new LLMError(`Local LLM request failed: ${response.status} ${response.statusText}`);
+    }
+
+    const data: LocalLLMResponse = await response.json();
+
+    if (!data.choices || data.choices.length === 0) {
+      throw new LLMError("Invalid response from local LLM");
+    }
+
+    return data.choices[0].message.content;
+  } catch (error) {
+    if (error instanceof LLMError) {
+      throw error;
+    }
+    throw new LLMError(`Failed to call local LLM: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
 
 /**
  * LLMService class
@@ -19,19 +79,25 @@ import { LLMError, QuotaExceededError, TimeoutError } from "./errors";
 export class LLMService {
   private model: ChatGoogleGenerativeAI | null = null;
   private config = getConfig();
+  private circuitBreaker: CircuitBreaker;
+  private isLocalProvider: boolean = false;
+
+  constructor() {
+    this.circuitBreaker = new CircuitBreaker();
+  }
 
   /**
    * Initializes the LLM model based on configuration
    * @private
    */
-  private initializeModel(): ChatGoogleGenerativeAI {
-    if (this.model) {
-      return this.model;
-    }
-
+  private initializeModel(): ChatGoogleGenerativeAI | null {
     const { llm } = this.config;
 
     if (llm.provider === "gemini") {
+      if (this.model) {
+        return this.model;
+      }
+
       if (!llm.apiKey) {
         throw new LLMError("Google API key is required for Gemini provider");
       }
@@ -45,17 +111,15 @@ export class LLMService {
         temperature,
         maxOutputTokens: llm.maxTokens,
       });
+      this.isLocalProvider = false;
+      return this.model;
     } else if (llm.provider === "local") {
-      // For local LLM endpoints, we would use a different implementation
-      // This is a placeholder for future local LLM support
-      throw new LLMError(
-        "Local LLM provider not yet implemented. Use 'gemini' provider."
-      );
+      // For local LLM endpoints, we use HTTP client
+      this.isLocalProvider = true;
+      return null;
     } else {
       throw new LLMError(`Unsupported LLM provider: ${llm.provider}`);
     }
-
-    return this.model;
   }
 
   /**
@@ -83,21 +147,40 @@ export class LLMService {
     userPrompt: string
   ): Promise<string> {
     try {
-      const model = this.initializeModel();
+      const response = await withRetryAndCircuitBreaker(
+        async () => {
+          // Initialize model (or check provider type)
+          this.initializeModel();
 
-      const messages = [
-        new SystemMessage(systemPrompt),
-        new HumanMessage(userPrompt),
-      ];
+          if (this.isLocalProvider) {
+            // Use local LLM endpoint
+            return await this.callLocalLLM(systemPrompt, userPrompt);
+          } else {
+            // Use Gemini
+            const model = this.model!;
+            const messages = [
+              new SystemMessage(systemPrompt),
+              new HumanMessage(userPrompt),
+            ];
 
-      const response = await model.invoke(messages);
+            const result = await model.invoke(messages);
 
-      // Return the LLM output verbatim (Requirement 11.1)
-      return typeof response.content === "string"
-        ? response.content
-        : String(response.content);
+            // Return the LLM output verbatim (Requirement 11.1)
+            return typeof result.content === "string"
+              ? result.content
+              : String(result.content);
+          }
+        },
+        this.circuitBreaker
+      );
+
+      return response;
     } catch (error: any) {
       // Handle specific error types
+      if (error.message?.includes("Circuit breaker is OPEN")) {
+        throw new ServiceUnavailableError("LLM service temporarily unavailable");
+      }
+
       if (error.message?.includes("quota")) {
         throw new QuotaExceededError("LLM API quota exceeded");
       }

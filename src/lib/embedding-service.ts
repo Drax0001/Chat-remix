@@ -9,7 +9,17 @@
 
 import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
 import { getConfig } from "./config";
-import { LLMError, QuotaExceededError, TimeoutError } from "./errors";
+import { LLMError, QuotaExceededError, TimeoutError, ServiceUnavailableError } from "./errors";
+import { CircuitBreaker, withRetryAndCircuitBreaker } from "./retry";
+
+// For local embedding endpoints
+interface LocalEmbeddingRequest {
+  texts: string[];
+}
+
+interface LocalEmbeddingResponse {
+  embeddings: number[][];
+}
 
 /**
  * EmbeddingService class
@@ -18,19 +28,25 @@ import { LLMError, QuotaExceededError, TimeoutError } from "./errors";
 export class EmbeddingService {
   private model: GoogleGenerativeAIEmbeddings | null = null;
   private config = getConfig();
+  private circuitBreaker: CircuitBreaker;
+  private isLocalProvider: boolean = false;
+
+  constructor() {
+    this.circuitBreaker = new CircuitBreaker();
+  }
 
   /**
    * Initializes the embedding model based on configuration
    * @private
    */
-  private initializeModel(): GoogleGenerativeAIEmbeddings {
-    if (this.model) {
-      return this.model;
-    }
-
+  private initializeModel(): GoogleGenerativeAIEmbeddings | null {
     const { embedding } = this.config;
 
     if (embedding.provider === "gemini") {
+      if (this.model) {
+        return this.model;
+      }
+
       if (!embedding.apiKey) {
         throw new LLMError(
           "Google API key is required for Gemini embedding provider"
@@ -41,19 +57,103 @@ export class EmbeddingService {
         apiKey: embedding.apiKey,
         model: embedding.modelName,
       });
+      this.isLocalProvider = false;
+      return this.model;
     } else if (embedding.provider === "local") {
-      // For local embedding endpoints, we would use a different implementation
-      // This is a placeholder for future local embedding support
-      throw new LLMError(
-        "Local embedding provider not yet implemented. Use 'gemini' provider."
-      );
+      // For local embedding endpoints, we use HTTP client
+      this.isLocalProvider = true;
+      return null;
     } else {
       throw new LLMError(
         `Unsupported embedding provider: ${embedding.provider}`
       );
     }
+  }
 
-    return this.model;
+  /**
+   * Calls a local embedding endpoint via HTTP
+   * @private
+   */
+  private async callLocalEmbedding(text: string): Promise<number[]> {
+    const { embedding } = this.config;
+
+    if (!embedding.endpoint) {
+      throw new LLMError("Local embedding endpoint is required for local provider");
+    }
+
+    const request: LocalEmbeddingRequest = {
+      texts: [text],
+    };
+
+    try {
+      const response = await fetch(embedding.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(request),
+      });
+
+      if (!response.ok) {
+        throw new LLMError(`Local embedding request failed: ${response.status} ${response.statusText}`);
+      }
+
+      const data: LocalEmbeddingResponse = await response.json();
+
+      if (!data.embeddings || data.embeddings.length === 0 || data.embeddings[0].length === 0) {
+        throw new LLMError("Invalid response from local embedding endpoint");
+      }
+
+      return data.embeddings[0];
+    } catch (error) {
+      if (error instanceof LLMError) {
+        throw error;
+      }
+      throw new LLMError(`Failed to call local embedding: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Calls a local embedding endpoint for batch processing
+   * @private
+   */
+  private async callLocalBatchEmbeddings(texts: string[]): Promise<number[][]> {
+    const { embedding } = this.config;
+
+    if (!embedding.endpoint) {
+      throw new LLMError("Local embedding endpoint is required for local provider");
+    }
+
+    const request: LocalEmbeddingRequest = {
+      texts,
+    };
+
+    try {
+      const response = await fetch(embedding.endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(request),
+      });
+
+      if (!response.ok) {
+        throw new LLMError(`Local embedding batch request failed: ${response.status} ${response.statusText}`);
+      }
+
+      const data: LocalEmbeddingResponse = await response.json();
+
+      if (!data.embeddings || data.embeddings.length !== texts.length) {
+        throw new LLMError("Invalid response from local embedding endpoint");
+      }
+
+      return data.embeddings;
+    } catch (error) {
+      if (error instanceof LLMError) {
+        throw error;
+      }
+      throw new LLMError(`Failed to call local embedding batch: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
   /**
@@ -75,11 +175,30 @@ export class EmbeddingService {
    */
   async generateEmbedding(text: string): Promise<number[]> {
     try {
-      const model = this.initializeModel();
-      const embedding = await model.embedQuery(text);
+      const embedding = await withRetryAndCircuitBreaker(
+        async () => {
+          // Initialize model (or check provider type)
+          this.initializeModel();
+
+          if (this.isLocalProvider) {
+            // Use local embedding endpoint
+            return await this.callLocalEmbedding(text);
+          } else {
+            // Use Gemini
+            const model = this.model!;
+            return await model.embedQuery(text);
+          }
+        },
+        this.circuitBreaker
+      );
+
       return embedding;
     } catch (error: any) {
       // Handle specific error types
+      if (error.message?.includes("Circuit breaker is OPEN")) {
+        throw new ServiceUnavailableError("Embedding service temporarily unavailable");
+      }
+
       if (error.message?.includes("quota")) {
         throw new QuotaExceededError("Embedding API quota exceeded");
       }
@@ -114,11 +233,30 @@ export class EmbeddingService {
    */
   async generateBatchEmbeddings(texts: string[]): Promise<number[][]> {
     try {
-      const model = this.initializeModel();
-      const embeddings = await model.embedDocuments(texts);
+      const embeddings = await withRetryAndCircuitBreaker(
+        async () => {
+          // Initialize model (or check provider type)
+          this.initializeModel();
+
+          if (this.isLocalProvider) {
+            // Use local embedding endpoint
+            return await this.callLocalBatchEmbeddings(texts);
+          } else {
+            // Use Gemini
+            const model = this.model!;
+            return await model.embedDocuments(texts);
+          }
+        },
+        this.circuitBreaker
+      );
+
       return embeddings;
     } catch (error: any) {
       // Handle specific error types
+      if (error.message?.includes("Circuit breaker is OPEN")) {
+        throw new ServiceUnavailableError("Embedding service temporarily unavailable");
+      }
+
       if (error.message?.includes("quota")) {
         throw new QuotaExceededError("Embedding API quota exceeded");
       }
